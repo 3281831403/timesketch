@@ -1,7 +1,6 @@
 """Index analyzer plugin for Yeti indicators."""
 
 import datetime
-import json
 import logging
 import re
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
@@ -269,10 +268,9 @@ class YetiBaseAnalyzer(interface.BaseAnalyzer):
             if (ioc["ioc"], ioc["externalURI"]) not in self._intelligence_refs:
                 self._intelligence_attribute["data"].append(ioc)
 
-        attribute_string = json.dumps(self._intelligence_attribute)
         self.sketch.add_sketch_attribute(
             "intelligence",
-            [attribute_string],
+            [self._intelligence_attribute],
             ontology="intelligence",
             overwrite=True,
         )

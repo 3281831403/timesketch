@@ -3397,3 +3397,179 @@ class CollaboratorResourceTest(BaseTest):
         )
         self.assertEqual(response.status_code, HTTP_STATUS_CODE_OK)
         self.assertFalse(sketch.has_permission(user=self.user2, permission="read"))
+
+
+class AttributeResourceTest(BaseTest):
+    """Test AttributeResource."""
+
+    resource_url = "/api/v1/sketches/1/attribute/"
+
+    def _post(self, payload):
+        return self.client.post(
+            self.resource_url,
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+    def _delete(self, payload):
+        return self.client.delete(
+            self.resource_url,
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+    def test_create_text_attribute(self):
+        """A text attribute can be created and read back through GET."""
+        self.login()
+        response = self._post(
+            {"name": "ioc", "ontology": "text", "values": ["1.2.3.4"]}
+        )
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_CREATED)
+        self.assertEqual(response.json["action"], "create")
+
+        response = self.client.get(self.resource_url)
+        self.assert200(response)
+        self.assertEqual(response.json["ioc"]["value"], "1.2.3.4")
+        self.assertEqual(response.json["ioc"]["ontology"], "text")
+
+    def test_multiple_values_have_list_shape(self):
+        """Multiple values are returned as a list, single values as scalars."""
+        self.login()
+        self._post({"name": "ioc", "ontology": "text", "values": ["a", "b"]})
+        response = self.client.get(self.resource_url)
+        self.assertEqual(response.json["ioc"]["value"], ["a", "b"])
+
+    def test_repeated_post_is_idempotent(self):
+        """Posting the same attribute twice updates instead of duplicating."""
+        self.login()
+        first = self._post({"name": "ioc", "ontology": "text", "values": ["1.2.3.4"]})
+        self.assertEqual(first.status_code, HTTP_STATUS_CODE_CREATED)
+        second = self._post({"name": "ioc", "ontology": "text", "values": ["1.2.3.4"]})
+        self.assertEqual(second.status_code, HTTP_STATUS_CODE_OK)
+        self.assertEqual(second.json["action"], "update")
+
+        from timesketch.models.sketch import Attribute
+        from timesketch.models.sketch import AttributeValue
+
+        rows = Attribute.query.filter_by(sketch_id=1, name="ioc").all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            AttributeValue.query.filter_by(attribute_id=rows[0].id).count(), 1
+        )
+
+    def test_overwrite_with_new_values_leaves_no_orphans(self):
+        """Updating values replaces the old value rows."""
+        self.login()
+        self._post({"name": "ioc", "ontology": "text", "values": ["a", "b"]})
+        self._post({"name": "ioc", "ontology": "text", "values": ["c"]})
+
+        from timesketch.models.sketch import Attribute
+        from timesketch.models.sketch import AttributeValue
+
+        rows = Attribute.query.filter_by(sketch_id=1, name="ioc").all()
+        self.assertEqual(len(rows), 1)
+        values = AttributeValue.query.filter_by(attribute_id=rows[0].id).all()
+        self.assertEqual([value.value for value in values], ["c"])
+        response = self.client.get(self.resource_url)
+        self.assertEqual(response.json["ioc"]["value"], "c")
+
+    def test_bool_attribute_round_trip(self):
+        """Boolean values round trip instead of being stringified."""
+        self.login()
+        self._post({"name": "flag", "ontology": "bool", "values": [True]})
+        response = self.client.get(self.resource_url)
+        self.assertIs(response.json["flag"]["value"], True)
+
+        self._post({"name": "flag", "ontology": "bool", "values": [False]})
+        response = self.client.get(self.resource_url)
+        self.assertIs(response.json["flag"]["value"], False)
+
+    def test_dict_attribute_round_trip(self):
+        """Dict (intelligence) values round trip."""
+        payload = {"data": [{"ioc": "evil.example", "externalURI": "http://x"}]}
+        self.login()
+        self._post(
+            {"name": "intelligence", "ontology": "intelligence", "values": [payload]}
+        )
+        response = self.client.get(self.resource_url)
+        self.assertEqual(response.json["intelligence"]["value"], payload)
+
+    def test_dict_ontology_rejects_wrong_type(self):
+        """A string value for a dict ontology is rejected and stores nothing."""
+        self.login()
+        response = self._post(
+            {"name": "broken", "ontology": "intelligence", "values": ["nope"]}
+        )
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_BAD_REQUEST)
+
+        from timesketch.models.sketch import Attribute
+
+        self.assertEqual(
+            Attribute.query.filter_by(sketch_id=1, name="broken").count(), 0
+        )
+
+    def test_ontology_change_keeps_single_row(self):
+        """Changing the ontology for a name updates the single existing row."""
+        self.login()
+        self._post({"name": "shared", "ontology": "text", "values": ["hello"]})
+        self._post({"name": "shared", "ontology": "int", "values": [42]})
+
+        from timesketch.models.sketch import Attribute
+
+        rows = Attribute.query.filter_by(sketch_id=1, name="shared").all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].ontology, "int")
+        response = self.client.get(self.resource_url)
+        self.assertEqual(response.json["shared"]["value"], 42)
+
+    def test_unknown_ontology_rejected(self):
+        """An unknown ontology is rejected."""
+        self.login()
+        response = self._post(
+            {"name": "x", "ontology": "no-such-ontology", "values": ["y"]}
+        )
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_BAD_REQUEST)
+
+    def test_missing_values_rejected(self):
+        """A post without values is rejected."""
+        self.login()
+        response = self._post({"name": "x", "ontology": "text"})
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_BAD_REQUEST)
+
+    def test_values_must_be_a_list(self):
+        """A scalar values field is rejected."""
+        self.login()
+        response = self._post({"name": "x", "ontology": "text", "values": "not-a-list"})
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_BAD_REQUEST)
+
+    def test_delete_removes_attribute_rows(self):
+        """DELETE removes the attribute and its value rows from the database."""
+        self.login()
+        self._post({"name": "ioc", "ontology": "text", "values": ["a", "b"]})
+        response = self._delete({"name": "ioc", "ontology": "text"})
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_OK)
+
+        from timesketch.models.sketch import Attribute
+        from timesketch.models.sketch import AttributeValue
+
+        self.assertEqual(Attribute.query.filter_by(sketch_id=1, name="ioc").count(), 0)
+        self.assertEqual(AttributeValue.query.count(), 0)
+        response = self.client.get(self.resource_url)
+        self.assertNotIn("ioc", response.json)
+
+    def test_delete_unknown_attribute_returns_bad_request(self):
+        """Deleting a missing attribute returns a bad request."""
+        self.login()
+        response = self._delete({"name": "missing", "ontology": "text"})
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_BAD_REQUEST)
+
+    def test_attribute_requires_write_permission(self):
+        """A user without write permission cannot create attributes."""
+        # Sketch 2 is created without ACLs for the logged in user.
+        self.login()
+        response = self.client.post(
+            "/api/v1/sketches/2/attribute/",
+            data=json.dumps({"name": "ioc", "ontology": "text", "values": ["1.2.3.4"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, HTTP_STATUS_CODE_FORBIDDEN)

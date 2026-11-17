@@ -24,15 +24,12 @@ from flask_login import current_user
 
 from timesketch.api.v1 import resources
 from timesketch.api.v1 import utils
-from timesketch.lib import ontology as ontology_lib
+from timesketch.lib import sketch_attributes
 from timesketch.lib.definitions import HTTP_STATUS_CODE_OK
 from timesketch.lib.definitions import HTTP_STATUS_CODE_BAD_REQUEST
 from timesketch.lib.definitions import HTTP_STATUS_CODE_CREATED
 from timesketch.lib.definitions import HTTP_STATUS_CODE_FORBIDDEN
 from timesketch.lib.definitions import HTTP_STATUS_CODE_NOT_FOUND
-from timesketch.models import db_session
-from timesketch.models.sketch import Attribute
-from timesketch.models.sketch import AttributeValue
 from timesketch.models.sketch import Sketch
 
 logger = logging.getLogger("timesketch.sketch_api")
@@ -115,10 +112,6 @@ class AttributeResource(resources.ResourceMixin, Resource):
         name = form.get("name")
         ontology = form.get("ontology", "text")
 
-        ontology_def = ontology_lib.ONTOLOGY
-        ontology_dict = ontology_def.get(ontology, {})
-        cast_as_string = ontology_dict.get("cast_as", "str")
-
         values = form.get("values")
         if not values:
             return abort(
@@ -128,60 +121,33 @@ class AttributeResource(resources.ResourceMixin, Resource):
         if not isinstance(values, (list, tuple)):
             return abort(HTTP_STATUS_CODE_BAD_REQUEST, "Values needs to be a list.")
 
-        value_strings = [
-            ontology_lib.OntologyManager.encode_value(x, cast_as_string) for x in values
-        ]
+        try:
+            cast_as_string = sketch_attributes.get_cast_as(ontology)
+            value_strings = sketch_attributes.encode_values(values, ontology)
+        except ValueError as exc:
+            return abort(HTTP_STATUS_CODE_BAD_REQUEST, str(exc))
 
-        if any(not isinstance(x, str) for x in value_strings):
-            return abort(
-                HTTP_STATUS_CODE_BAD_REQUEST,
-                "All values needs to be stored as strings.",
-            )
-
-        attribute = None
-        message = ""
-        update_attribute = False
-        for attribute in sketch.attributes:
-            if (attribute.name == name) and (attribute.ontology == ontology):
-                message = "Attribute Updated"
-                update_attribute = True
-                break
-
-        if update_attribute:
-            _ = AttributeValue.query.filter_by(attribute=attribute).delete()
-        else:
-            attribute = Attribute(
-                user=current_user, sketch=sketch, name=name, ontology=ontology
-            )
-
-            db_session.add(attribute)
-            db_session.commit()
-
-        for value in value_strings:
-            attribute_value = AttributeValue(
-                user=current_user, attribute=attribute, value=value
-            )
-            attribute.values.append(attribute_value)
-            db_session.add(attribute_value)
-            db_session.commit()
-
-        db_session.add(attribute)
-        db_session.commit()
+        _, created = sketch_attributes.set_sketch_attribute(
+            sketch=sketch,
+            name=name,
+            values=value_strings,
+            ontology=ontology,
+            user=current_user,
+        )
 
         return_data = {
             "name": name,
             "ontology": ontology,
             "cast_as": cast_as_string,
         }
-        response = None
-        if message:
-            return_data["action"] = "update"
-            response = jsonify(return_data)
-            response.status_code = HTTP_STATUS_CODE_OK
-        else:
+        if created:
             return_data["action"] = "create"
             response = jsonify(return_data)
             response.status_code = HTTP_STATUS_CODE_CREATED
+        else:
+            return_data["action"] = "update"
+            response = jsonify(return_data)
+            response.status_code = HTTP_STATUS_CODE_OK
 
         return response
 
@@ -221,21 +187,13 @@ class AttributeResource(resources.ResourceMixin, Resource):
         name = form.get("name")
         ontology = form.get("ontology", "text")
 
-        for attribute in sketch.attributes:
-            if attribute.name != name:
-                continue
-            if attribute.ontology != ontology:
-                continue
-
-            for value in attribute.values:
-                attribute.values.remove(value)
-            sketch.attributes.remove(attribute)
-            db_session.add(sketch)
-            db_session.commit()
-
-            return HTTP_STATUS_CODE_OK
-
-        return abort(
-            HTTP_STATUS_CODE_BAD_REQUEST,
-            "Unable to delete the attribute, couldn't find it.",
+        deleted = sketch_attributes.delete_sketch_attribute(
+            sketch=sketch, name=name, ontology=ontology
         )
+        if not deleted:
+            return abort(
+                HTTP_STATUS_CODE_BAD_REQUEST,
+                "Unable to delete the attribute, couldn't find it.",
+            )
+
+        return HTTP_STATUS_CODE_OK

@@ -90,7 +90,7 @@ class Sketch(AccessControlMixin, LabelMixin, StatusMixin, CommentMixin, BaseMode
         "Attribute",
         backref="sketch",
         lazy="select",
-        cascade="save-update, merge, delete",
+        cascade="all, delete-orphan",
     )
     graphs = relationship(
         "Graph",
@@ -492,7 +492,12 @@ class Attribute(BaseModel):
     sketch_id = Column(Integer, ForeignKey("sketch.id"))
     name = Column(UnicodeText())
     ontology = Column(UnicodeText())
-    values = relationship("AttributeValue", backref="attribute", lazy="select")
+    values = relationship(
+        "AttributeValue",
+        backref="attribute",
+        lazy="select",
+        cascade="all, delete-orphan",
+    )
 
 
 class AttributeValue(BaseModel):

@@ -31,12 +31,11 @@ import pandas
 from timesketch.api.v1 import utils as api_utils
 
 from timesketch.lib import definitions
+from timesketch.lib import sketch_attributes
 from timesketch.lib import telemetry
 from timesketch.lib.datastores.opensearch import OpenSearchDataStore
 from timesketch.models import db_session
 from timesketch.models.sketch import Aggregation
-from timesketch.models.sketch import Attribute
-from timesketch.models.sketch import AttributeValue
 from timesketch.models.sketch import AggregationGroup as SQLAggregationGroup
 from timesketch.models.sketch import Event as SQLEvent
 from timesketch.models.sketch import Sketch as SQLSketch
@@ -536,38 +535,60 @@ class Sketch:
     def add_sketch_attribute(self, name, values, ontology="text", overwrite=False):
         """Add an attribute to the sketch.
 
+        The attribute is stored through the same encoding and identity rules as
+        the REST API: an attribute is identified by its name within the sketch,
+        the ontology follows the most recent write and values are encoded
+        according to the ontology so that they round trip unchanged.
+
         Args:
-            name (str): The name of the attribute
-            values (list): A list of strings, which contains the values of the
-                attribute.
+            name (str): The name of the attribute.
+            values (list): A list of values to store. Each value needs to be of
+                the native Python type that matches the ontology (e.g. bool for
+                "bool", dict for "intelligence", str for "text").
             ontology (str): Ontology of the attribute, matches with
                 data/ontology.yaml.
             overwrite (bool): If True and the attribute already exists,
-                overwrite it.
+                overwrite it. If False, values are appended to the existing
+                attribute while keeping the same single attribute row.
+
+        Raises:
+            ValueError: If the ontology is not defined or a value does not
+                match the ontology type.
         """
-        # Check first whether the attribute already exists.
-        attribute = Attribute.query.filter_by(name=name, sketch=self.sql_sketch).first()
+        if not isinstance(values, (list, tuple)):
+            values = [values]
 
-        if not attribute:
-            attribute = Attribute(
-                user=None, sketch=self.sql_sketch, name=name, ontology=ontology
+        existing_attribute = None
+        if not overwrite:
+            existing_attribute = next(
+                (
+                    attribute
+                    for attribute in self.sql_sketch.attributes
+                    if attribute.name == name
+                ),
+                None,
             )
-            db_session.add(attribute)
-            db_session.commit()
 
-        if overwrite:
-            attribute.values = []
+        if existing_attribute:
+            # Appending keeps the existing single attribute row and its
+            # ontology, so the new values are encoded with that ontology rather
+            # than the one requested by this call.
+            ontology = existing_attribute.ontology
 
-        for value in values:
-            attribute_value = AttributeValue(
-                user=None, attribute=attribute, value=value
-            )
-            attribute.values.append(attribute_value)
-            db_session.add(attribute_value)
-            db_session.commit()
+        value_strings = sketch_attributes.encode_values(values, ontology)
 
-        db_session.add(attribute)
-        db_session.commit()
+        if existing_attribute:
+            value_strings = [
+                attribute_value.value for attribute_value in existing_attribute.values
+            ] + value_strings
+
+        sketch_attributes.set_sketch_attribute(
+            sketch=self.sql_sketch,
+            name=name,
+            values=value_strings,
+            ontology=ontology,
+            user=None,
+        )
 
     def get_sketch_attributes(self, name):
         """Get attributes from a sketch.
