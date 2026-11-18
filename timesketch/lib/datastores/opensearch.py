@@ -427,6 +427,101 @@ class OpenSearchDataStore:
             label_query["bool"]["must"].append(nested_query)
         return label_query
 
+    def _build_chips_query_filters(
+        self, sketch_id: int, query_filter: Optional[Dict]
+    ) -> tuple:
+        """Build filter clauses from UI filter chips and the legacy star flag.
+
+        This is the single place where chip semantics are defined, so that
+        search, count, CSV export and Explore aggregations all filter the
+        same way:
+
+            * Chips the user disabled are skipped.
+            * Each active chip contributes exactly one filter clause (no
+              duplicated filters).
+            * Term chips honor their operator (must / must_not).
+            * Label chips are combined into a single nested label query.
+              The legacy ``star`` filter flag maps to the ``__ts_star``
+              label and only keeps starred events.
+            * Multiple datetime chips are unioned (OR) through a bool
+              should clause.
+
+        Args:
+            sketch_id: Integer of sketch primary key.
+            query_filter: Dictionary containing filters to apply, or None.
+
+        Returns:
+            Tuple of two lists: (must_clauses, must_not_clauses).
+        """
+        must_clauses = []
+        must_not_clauses = []
+
+        if not query_filter:
+            return must_clauses, must_not_clauses
+
+        labels = []
+        datetime_ranges = {"bool": {"should": [], "minimum_should_match": 1}}
+
+        # Legacy star filter, used by API clients and external scripts.
+        if query_filter.get("star", None):
+            labels.append("__ts_star")
+
+        for chip in query_filter.get("chips", None) or []:
+            # Exclude chips that the user disabled
+            if not chip.get("active", True):
+                continue
+
+            # Increase metrics per chip type
+            METRICS["search_filter_type"].labels(type=chip["type"]).inc()
+            if chip["type"] == "label":
+                labels.append(chip["value"])
+
+            elif chip["type"] == "term":
+                if isinstance(chip["value"], str):
+                    term_filter = {
+                        "match_phrase": {
+                            "{}.keyword".format(chip["field"]): {
+                                "query": "{}".format(chip["value"])
+                            }
+                        }
+                    }
+                else:
+                    term_filter = {
+                        "match_phrase": {
+                            "{}".format(chip["field"]): {
+                                "query": "{}".format(chip["value"])
+                            }
+                        }
+                    }
+
+                if chip["operator"] == "must":
+                    must_clauses.append(term_filter)
+
+                elif chip["operator"] == "must_not":
+                    must_not_clauses.append(term_filter)
+
+            elif chip["type"].startswith("datetime"):
+                range_filter = lambda start, end: {  # pylint: disable=unnecessary-lambda-assignment
+                    "range": {"datetime": {"gte": start, "lte": end}}
+                }
+                if chip["type"] == "datetime_range":
+                    start, end = chip["value"].split(",")
+                elif chip["type"] == "datetime_interval":
+                    start, end = self._convert_to_time_range(chip["value"])
+                else:
+                    continue
+                datetime_ranges["bool"]["should"].append(range_filter(start, end))
+
+        if labels:
+            # Dedupe labels (preserving order) so each label filters once.
+            unique_labels = list(dict.fromkeys(labels))
+            must_clauses.append(self._build_labels_query(sketch_id, unique_labels))
+
+        if datetime_ranges["bool"]["should"]:
+            must_clauses.append(datetime_ranges)
+
+        return must_clauses, must_not_clauses
+
     @staticmethod
     def _build_events_query(events):
         """Build OpenSearch query for one or more document ids.
@@ -634,6 +729,21 @@ class OpenSearchDataStore:
                 if query_filter.get("size", None):
                     query_dsl["size"] = query_filter["size"]
 
+            # Apply UI filter chips and the legacy star filter on top of
+            # the provided DSL, so both the DSL and the chips filter the
+            # result.
+            chip_must, chip_must_not = self._build_chips_query_filters(
+                sketch_id, query_filter
+            )
+            if chip_must or chip_must_not:
+                existing_query = query_dsl.get("query")
+                combined_bool = {"must": [], "must_not": [], "filter": []}
+                if existing_query:
+                    combined_bool["must"].append(existing_query)
+                combined_bool["must"].extend(chip_must)
+                combined_bool["must_not"].extend(chip_must_not)
+                query_dsl["query"] = {"bool": combined_bool}
+
             if aggregations:
                 # post_filter happens after aggregation so we need to move the
                 # filter to the query instead.
@@ -682,62 +792,15 @@ class OpenSearchDataStore:
         if special_char_query:
             query_dsl["query"]["bool"]["must"].append(special_char_query)
 
-        # New UI filters
-        if query_filter.get("chips", None):
-            labels = []
-            must_filters = query_dsl["query"]["bool"]["must"]
-            must_not_filters = query_dsl["query"]["bool"]["must_not"]
-            datetime_ranges = {"bool": {"should": [], "minimum_should_match": 1}}
-
-            for chip in query_filter["chips"]:
-                # Exclude chips that the user disabled
-                if not chip.get("active", True):
-                    continue
-
-                # Increase metrics per chip type
-                METRICS["search_filter_type"].labels(type=chip["type"]).inc()
-                if chip["type"] == "label":
-                    labels.append(chip["value"])
-
-                elif chip["type"] == "term":
-                    if isinstance(chip["value"], str):
-                        term_filter = {
-                            "match_phrase": {
-                                "{}.keyword".format(chip["field"]): {
-                                    "query": "{}".format(chip["value"])
-                                }
-                            }
-                        }
-                    else:
-                        term_filter = {
-                            "match_phrase": {
-                                "{}".format(chip["field"]): {
-                                    "query": "{}".format(chip["value"])
-                                }
-                            }
-                        }
-
-                    if chip["operator"] == "must":
-                        must_filters.append(term_filter)
-
-                    elif chip["operator"] == "must_not":
-                        must_not_filters.append(term_filter)
-
-                elif chip["type"].startswith("datetime"):
-                    range_filter = lambda start, end: {  # pylint: disable=unnecessary-lambda-assignment
-                        "range": {"datetime": {"gte": start, "lte": end}}
-                    }
-                    if chip["type"] == "datetime_range":
-                        start, end = chip["value"].split(",")
-                    elif chip["type"] == "datetime_interval":
-                        start, end = self._convert_to_time_range(chip["value"])
-                    else:
-                        continue
-                    datetime_ranges["bool"]["should"].append(range_filter(start, end))
-
-                label_filter = self._build_labels_query(sketch_id, labels)
-                must_filters.append(label_filter)
-                must_filters.append(datetime_ranges)
+        # UI filter chips and the legacy star filter. These share a single
+        # implementation (see _build_chips_query_filters) so that search,
+        # count, CSV export and Explore aggregations all apply the same
+        # filter semantics.
+        chip_must, chip_must_not = self._build_chips_query_filters(
+            sketch_id, query_filter
+        )
+        query_dsl["query"]["bool"]["must"].extend(chip_must)
+        query_dsl["query"]["bool"]["must_not"].extend(chip_must_not)
 
         # Pagination
         if query_filter.get("from", None):

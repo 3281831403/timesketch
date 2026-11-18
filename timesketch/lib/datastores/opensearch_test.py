@@ -577,3 +577,339 @@ class OpenSearchDataStoreTest(BaseTest):
         mock_es_instance.indices.create.assert_any_call(
             index=first_index_name, body=mock.ANY
         )
+
+
+class OpenSearchBuildQueryTest(BaseTest):
+    """Tests for build_query filter chip semantics.
+
+    These tests assert the actual query body that is sent to OpenSearch
+    for fixed chip combinations, making sure search, count, CSV export
+    and Explore aggregations all share the same filter semantics.
+    """
+
+    # Fixed chip combinations used across the tests.
+    TERM_CHIP = {
+        "type": "term",
+        "field": "hostname",
+        "value": "evil.example.com",
+        "operator": "must",
+        "active": True,
+    }
+    TERM_CHIP_EXCLUDE = {
+        "type": "term",
+        "field": "username",
+        "value": "system",
+        "operator": "must_not",
+        "active": True,
+    }
+    LABEL_CHIP = {
+        "type": "label",
+        "field": "",
+        "value": "bad",
+        "operator": "must",
+        "active": True,
+    }
+    DATETIME_CHIP_1 = {
+        "type": "datetime_range",
+        "field": "",
+        "value": "2023-01-01T00:00:00,2023-01-02T00:00:00",
+        "operator": "must",
+        "active": True,
+    }
+    DATETIME_CHIP_2 = {
+        "type": "datetime_range",
+        "field": "",
+        "value": "2023-02-01T00:00:00,2023-02-02T00:00:00",
+        "operator": "must",
+        "active": True,
+    }
+
+    EXPECTED_TERM_FILTER = {
+        "match_phrase": {"hostname.keyword": {"query": "evil.example.com"}}
+    }
+    EXPECTED_TERM_FILTER_EXCLUDE = {
+        "match_phrase": {"username.keyword": {"query": "system"}}
+    }
+    EXPECTED_LABEL_FILTER = {
+        "bool": {
+            "must": [
+                {
+                    "nested": {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {"term": {"timesketch_label.name.keyword": "bad"}},
+                                    {"term": {"timesketch_label.sketch_id": 1}},
+                                ]
+                            }
+                        },
+                        "path": "timesketch_label",
+                    }
+                }
+            ]
+        }
+    }
+    EXPECTED_STAR_FILTER = {
+        "bool": {
+            "must": [
+                {
+                    "nested": {
+                        "query": {
+                            "bool": {
+                                "must": [
+                                    {
+                                        "term": {
+                                            "timesketch_label.name.keyword": "__ts_star"
+                                        }
+                                    },
+                                    {"term": {"timesketch_label.sketch_id": 1}},
+                                ]
+                            }
+                        },
+                        "path": "timesketch_label",
+                    }
+                }
+            ]
+        }
+    }
+    EXPECTED_DATETIME_UNION = {
+        "bool": {
+            "should": [
+                {
+                    "range": {
+                        "datetime": {
+                            "gte": "2023-01-01T00:00:00",
+                            "lte": "2023-01-02T00:00:00",
+                        }
+                    }
+                },
+                {
+                    "range": {
+                        "datetime": {
+                            "gte": "2023-02-01T00:00:00",
+                            "lte": "2023-02-02T00:00:00",
+                        }
+                    }
+                },
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+    EXPECTED_QUERY_STRING = {"query_string": {"query": "*", "default_operator": "AND"}}
+
+    def _get_datastore(self, mock_client):
+        """Create a datastore instance backed by a mocked client."""
+        mock_es = mock_client.return_value
+        mock_es.info.return_value = {"version": {"number": "2.19.5"}}
+        datastore = OpenSearchDataStore(host="127.0.0.1", port=9200)
+        datastore.client = mock_es
+        return datastore
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_term_chips_filter_exactly_once(self, mock_client):
+        """Active term chips (incl. exclusion) filter exactly once."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {"chips": [self.TERM_CHIP, self.TERM_CHIP_EXCLUDE]}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        self.assertEqual(
+            bool_query["must"], [self.EXPECTED_QUERY_STRING, self.EXPECTED_TERM_FILTER]
+        )
+        self.assertEqual(bool_query["must_not"], [self.EXPECTED_TERM_FILTER_EXCLUDE])
+        self.assertEqual(bool_query["filter"], [])
+        # No empty label/datetime bool clauses may be emitted.
+        self.assertNotIn({"bool": {"must": []}}, bool_query["must"])
+        self.assertNotIn(
+            {"bool": {"should": [], "minimum_should_match": 1}}, bool_query["must"]
+        )
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_label_chip_builds_single_nested_filter(self, mock_client):
+        """A label chip produces exactly one nested label filter."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {"chips": [self.LABEL_CHIP]}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        self.assertEqual(
+            bool_query["must"], [self.EXPECTED_QUERY_STRING, self.EXPECTED_LABEL_FILTER]
+        )
+        self.assertEqual(bool_query["must_not"], [])
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_datetime_chips_are_unioned(self, mock_client):
+        """Multiple datetime chips are combined with OR (should)."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {"chips": [self.DATETIME_CHIP_1, self.DATETIME_CHIP_2]}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        self.assertEqual(
+            bool_query["must"],
+            [self.EXPECTED_QUERY_STRING, self.EXPECTED_DATETIME_UNION],
+        )
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_mixed_chips_do_not_duplicate_filters(self, mock_client):
+        """Label and datetime filters are appended once, not per chip."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {
+            "chips": [self.LABEL_CHIP, self.DATETIME_CHIP_1, self.TERM_CHIP]
+        }
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        expected_datetime = {
+            "bool": {
+                "should": [self.EXPECTED_DATETIME_UNION["bool"]["should"][0]],
+                "minimum_should_match": 1,
+            }
+        }
+        self.assertEqual(
+            bool_query["must"],
+            [
+                self.EXPECTED_QUERY_STRING,
+                self.EXPECTED_TERM_FILTER,
+                self.EXPECTED_LABEL_FILTER,
+                expected_datetime,
+            ],
+        )
+        # Each filter clause appears exactly once.
+        self.assertEqual(bool_query["must"].count(self.EXPECTED_LABEL_FILTER), 1)
+        self.assertEqual(bool_query["must"].count(expected_datetime), 1)
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_inactive_chips_are_skipped(self, mock_client):
+        """Chips the user disabled do not contribute any filter clause."""
+        datastore = self._get_datastore(mock_client)
+        inactive_term = dict(self.TERM_CHIP, active=False)
+        inactive_label = dict(self.LABEL_CHIP, active=False)
+        query_filter = {"chips": [inactive_term, inactive_label]}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        self.assertEqual(bool_query["must"], [self.EXPECTED_QUERY_STRING])
+        self.assertEqual(bool_query["must_not"], [])
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_star_filter_keeps_only_starred_events(self, mock_client):
+        """The legacy star filter flag maps to the __ts_star label."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {"star": True}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        self.assertEqual(
+            bool_query["must"], [self.EXPECTED_QUERY_STRING, self.EXPECTED_STAR_FILTER]
+        )
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_star_filter_combined_with_chips(self, mock_client):
+        """Star flag and chips stack within the same filter semantics."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {"star": True, "chips": [self.TERM_CHIP]}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        bool_query = query["query"]["bool"]
+        self.assertEqual(
+            bool_query["must"],
+            [
+                self.EXPECTED_QUERY_STRING,
+                self.EXPECTED_TERM_FILTER,
+                self.EXPECTED_STAR_FILTER,
+            ],
+        )
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_dsl_and_chips_are_both_applied(self, mock_client):
+        """A saved-view DSL stacked with chips keeps both filters."""
+        datastore = self._get_datastore(mock_client)
+        query_dsl = {"query": {"match_all": {}}}
+        query_filter = {
+            "chips": [self.TERM_CHIP, self.TERM_CHIP_EXCLUDE],
+            "from": 40,
+            "size": 40,
+            "order": "desc",
+        }
+
+        query = datastore.build_query(1, "", query_filter, query_dsl=query_dsl)
+
+        self.assertEqual(
+            query["query"],
+            {
+                "bool": {
+                    "must": [{"match_all": {}}, self.EXPECTED_TERM_FILTER],
+                    "must_not": [self.EXPECTED_TERM_FILTER_EXCLUDE],
+                    "filter": [],
+                }
+            },
+        )
+        # Pagination and sorting are preserved.
+        self.assertEqual(query["from"], 40)
+        self.assertEqual(query["size"], 40)
+        self.assertEqual(query["sort"], {"datetime": "desc"})
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_dsl_without_chips_is_untouched(self, mock_client):
+        """A DSL without chips keeps its original query structure."""
+        datastore = self._get_datastore(mock_client)
+        query_dsl = {"query": {"match_all": {}}}
+
+        query = datastore.build_query(1, "", {}, query_dsl=query_dsl)
+
+        self.assertEqual(query["query"], {"match_all": {}})
+        self.assertEqual(query["sort"], {"datetime": "asc"})
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_pagination_and_sort_defaults(self, mock_client):
+        """Return structure, pagination and sorting stay unchanged."""
+        datastore = self._get_datastore(mock_client)
+        query_filter = {"chips": [self.TERM_CHIP], "from": 80, "size": 40}
+
+        query = datastore.build_query(1, "*", query_filter)
+
+        self.assertEqual(query["from"], 80)
+        self.assertEqual(query["size"], 40)
+        self.assertEqual(query["sort"], {"datetime": "asc"})
+        self.assertEqual(
+            set(query["query"]["bool"].keys()), {"must", "must_not", "filter"}
+        )
+
+    @mock.patch("timesketch.lib.datastores.opensearch.OpenSearch")
+    def test_search_and_count_share_filter_semantics(self, mock_client):
+        """The query body sent for search and count uses the same filters."""
+        datastore = self._get_datastore(mock_client)
+        mock_es = mock_client.return_value
+        mock_es.search.return_value = {"hits": {"hits": [], "total": 0}, "took": 0}
+        mock_es.count.return_value = {"count": 0}
+
+        query_filter = {"star": True, "chips": [self.TERM_CHIP]}
+        expected_must = [
+            self.EXPECTED_QUERY_STRING,
+            self.EXPECTED_TERM_FILTER,
+            self.EXPECTED_STAR_FILTER,
+        ]
+
+        datastore.search(
+            sketch_id=1, indices=["test"], query_string="*", query_filter=query_filter
+        )
+        search_body = mock_es.search.call_args[1]["body"]
+        self.assertEqual(search_body["query"]["bool"]["must"], expected_must)
+
+        datastore.search(
+            sketch_id=1,
+            indices=["test"],
+            query_string="*",
+            query_filter=query_filter,
+            count=True,
+        )
+        count_body = mock_es.count.call_args[1]["body"]
+        self.assertEqual(count_body["query"]["bool"]["must"], expected_must)
